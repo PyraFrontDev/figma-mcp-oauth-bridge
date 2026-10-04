@@ -1,0 +1,26 @@
+{
+	"name": "figma-mcp-oauth-bridge",
+	"version": "1.0.0",
+	"type": "module",
+	"main": "server.mjs",
+	"scripts": {
+		"dev": "nodemon server.mjs",
+		"start": "node server.mjs"
+	},
+	"keywords": ["mcp", "oauth2", "pkce", "figma", "jwt"],
+	"author": "Robert Mielcarek",
+	"license": "ISC",
+	"description": "Self-hosted OAuth 2.0 (PKCE) authorization server + Model Context Protocol gateway bridging Figma Desktop to external AI clients.",
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@vkhanhqui/figma-mcp-go": "^0.1.3",
+		"cors": "^2.8.6",
+		"dotenv": "^17.4.2",
+		"express": "^5.2.1",
+		"jose": "^6.2.9",
+		"zod": "^4.6.5"
+	},
+	"devDependencies": {
+		"nodemon": "^3.1.14"
+	}
+}
