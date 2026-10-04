@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import { SignJWT, jwtVerify } from 'jose'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -34,6 +38,82 @@ const perplexityRedirectUris = new Set([
 
 const authorizationCodes = new Map()
 const refreshTokens = new Map()
+
+// --- Figma bridge: follower stdio client + read-only allowlist ---
+
+const figmaGoRunJs = path.join(
+	__dirname, 'node_modules', '@vkhanhqui', 'figma-mcp-go', 'bin', 'run.js',
+)
+
+const ALLOWED_READONLY_TOOLS = new Set([
+	'get_annotations', 'get_design_context', 'get_document', 'get_fonts',
+	'get_local_components', 'get_metadata', 'get_node', 'get_nodes_info',
+	'get_pages', 'get_reactions', 'get_screenshot', 'get_selection',
+	'get_styles', 'get_variable_defs', 'get_viewport', 'scan_nodes_by_types',
+	'scan_text_nodes', 'search_nodes', 'save_screenshots',
+	'export_frames_to_pdf', 'export_tokens',
+])
+
+let figmaClient = null
+let figmaToolDefs = []
+let figmaConnecting = null
+
+async function connectFigmaGoAsFollower() {
+	const transport = new StdioClientTransport({
+		command: 'node',
+		args: [figmaGoRunJs],
+		cwd: __dirname,
+	})
+	const client = new Client({ name: 'figma-perplexity-mcp-gateway', version: '1.0.0' })
+	await client.connect(transport)
+	return client
+}
+
+async function ensureFigmaFollower() {
+	if (figmaClient) return figmaClient
+	if (figmaConnecting) return figmaConnecting
+
+	figmaConnecting = (async () => {
+		console.log('Connecting to figma-mcp-go as a follower client...')
+		const client = await connectFigmaGoAsFollower()
+		const result = await client.listTools()
+		figmaToolDefs = result.tools.filter(t => ALLOWED_READONLY_TOOLS.has(t.name))
+
+		console.log(`Total tools discovered: ${result.tools.length}`)
+		console.log(`Allowlisted read-only tools exposed: ${figmaToolDefs.length}`)
+
+		figmaClient = client
+		return client
+	})()
+
+	return figmaConnecting
+}
+
+function createBridgedMcpServer() {
+	const server = new McpServer({ name: 'figma-perplexity-mcp', version: '1.0.0' })
+
+	for (const toolDef of figmaToolDefs) {
+		server.registerTool(
+			toolDef.name,
+			{
+				title: toolDef.title || toolDef.name,
+				description: toolDef.description || '',
+				inputSchema: toolDef.inputSchema,
+			},
+			async (args) => {
+				if (!ALLOWED_READONLY_TOOLS.has(toolDef.name)) {
+					throw new Error(`Tool "${toolDef.name}" is not allowed on this gateway.`)
+				}
+				if (!figmaClient) {
+					throw new Error('figma-mcp-go follower client is not connected.')
+				}
+				return figmaClient.callTool({ name: toolDef.name, arguments: args })
+			},
+		)
+	}
+
+	return server
+}
 
 // --- Express app + OAuth ---
 
@@ -319,7 +399,85 @@ app.post('/token', async (req, res) => {
 	}
 })
 
+// --- Bridge /mcp: figma-mcp-go follower + allowlist ---
+
+const transports = new Map()
+
+function isInitializeRequest(body) {
+	return body?.jsonrpc === '2.0' && body?.method === 'initialize'
+}
+
+async function handleMcpRequest(req, res) {
+	try {
+		await verifyAccessToken(req.get('authorization'))
+	} catch {
+		return sendMcpUnauthorized(res)
+	}
+
+	try {
+		await ensureFigmaFollower()
+	} catch (error) {
+		return res.status(502).json({
+			error: 'figma_bridge_unavailable',
+			detail: error.message,
+		})
+	}
+
+	const sessionId = req.get('mcp-session-id')
+	let transport = sessionId ? transports.get(sessionId) : undefined
+
+	if (!transport && isInitializeRequest(req.body)) {
+		let createdTransport
+
+		createdTransport = new StreamableHTTPServerTransport({
+			sessionIdGenerator: () => crypto.randomUUID(),
+			onsessioninitialized: newSessionId => {
+				transports.set(newSessionId, createdTransport)
+			},
+		})
+
+		createdTransport.onclose = () => {
+			if (createdTransport.sessionId) {
+				transports.delete(createdTransport.sessionId)
+			}
+		}
+
+		const server = createBridgedMcpServer()
+		await server.connect(createdTransport)
+		transport = createdTransport
+	}
+
+	if (!transport) {
+		return res.status(400).json({
+			jsonrpc: '2.0',
+			error: { code: -32000, message: 'Bad Request: missing or invalid MCP session ID' },
+			id: req.body?.id ?? null,
+		})
+	}
+
+	try {
+		await transport.handleRequest(req, res, req.body)
+	} catch (error) {
+		console.error('MCP request failed:', error)
+		if (!res.headersSent) {
+			return res.status(500).json({
+				jsonrpc: '2.0',
+				error: { code: -32603, message: 'Internal server error' },
+				id: req.body?.id ?? null,
+			})
+		}
+	}
+}
+
+app.get('/mcp', handleMcpRequest)
+app.post('/mcp', handleMcpRequest)
+app.delete('/mcp', handleMcpRequest)
+
 app.listen(port, '127.0.0.1', () => {
 	console.log(`Gateway local: http://127.0.0.1:${port}`)
-	console.log(`OAuth issuer: ${issuer}`)
+	console.log(`MCP endpoint: ${baseUrl}/mcp`)
+
+	ensureFigmaFollower().catch(error => {
+		console.error('Initial figma-mcp-go connection failed (will retry on first /mcp request):', error)
+	})
 })
