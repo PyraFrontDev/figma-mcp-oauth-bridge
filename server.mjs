@@ -9,6 +9,52 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { z } from 'zod'
+
+// The MCP SDK validates tool inputSchema through Standard Schema (Zod), so the
+// raw JSON Schema coming from figma-mcp-go has to be converted before registration.
+function jsonPropToZod(prop) {
+  if (!prop || typeof prop !== 'object') return z.any()
+
+  let zodType
+  switch (prop.type) {
+    case 'string':
+      zodType = Array.isArray(prop.enum) ? z.enum(prop.enum) : z.string()
+      break
+    case 'number':
+    case 'integer':
+      zodType = z.number()
+      break
+    case 'boolean':
+      zodType = z.boolean()
+      break
+    case 'array':
+      zodType = z.array(prop.items ? jsonPropToZod(prop.items) : z.any())
+      break
+    case 'object':
+      zodType = z.object(jsonSchemaToZodShape(prop)).passthrough()
+      break
+    default:
+      zodType = z.any()
+  }
+
+  if (prop.description) zodType = zodType.describe(prop.description)
+  return zodType
+}
+
+function jsonSchemaToZodShape(schema) {
+  const properties = schema?.properties || {}
+  const required = new Set(schema?.required || [])
+  const shape = {}
+
+  for (const [key, prop] of Object.entries(properties)) {
+    let zodType = jsonPropToZod(prop)
+    if (!required.has(key)) zodType = zodType.optional()
+    shape[key] = zodType
+  }
+
+  return shape
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -98,7 +144,7 @@ function createBridgedMcpServer() {
 			{
 				title: toolDef.title || toolDef.name,
 				description: toolDef.description || '',
-				inputSchema: toolDef.inputSchema,
+				inputSchema: jsonSchemaToZodShape(toolDef.inputSchema),
 			},
 			async (args) => {
 				if (!ALLOWED_READONLY_TOOLS.has(toolDef.name)) {
